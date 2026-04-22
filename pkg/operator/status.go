@@ -6,6 +6,7 @@ import (
 
 	appsv1 "k8s.io/api/apps/v1"
 	"k8s.io/apimachinery/pkg/util/sets"
+	"k8s.io/utils/ptr"
 
 	operatorv1 "github.com/openshift/api/operator/v1"
 	"github.com/openshift/library-go/pkg/operator/v1helpers"
@@ -86,19 +87,24 @@ func isDeploymentStatusAvailableAndUpdated(deploy appsv1.Deployment) bool {
 }
 
 func isDeploymentStatusComplete(deploy appsv1.Deployment) bool {
-	replicas := int32(1)
-	if deploy.Spec.Replicas != nil {
-		replicas = *(deploy.Spec.Replicas)
-	}
-	return deploy.Status.UpdatedReplicas == replicas &&
-		deploy.Status.Replicas == replicas &&
-		deploy.Status.AvailableReplicas == replicas &&
-		deploy.Status.ObservedGeneration >= deploy.Generation
+	desiredReplicas := ptr.Deref(deploy.Spec.Replicas, 1)
+	return isDeploymentUpToDate(deploy) && deploy.Status.AvailableReplicas == desiredReplicas
+}
+
+// isDeploymentUpToDate returns true when the deployment controller has
+// observed the current spec and all replicas use the current pod template.
+func isDeploymentUpToDate(deploy appsv1.Deployment) bool {
+	desiredReplicas := ptr.Deref(deploy.Spec.Replicas, 1)
+	return deploy.Status.ObservedGeneration >= deploy.Generation &&
+		deploy.Status.UpdatedReplicas == desiredReplicas &&
+		deploy.Status.Replicas == desiredReplicas
 }
 
 func (c *serviceCAOperator) syncStatus(operatorConfigCopy *operatorv1.ServiceCA, existingDeployments *appsv1.DeploymentList, targetDeploymentNames sets.String) {
 	versionUpdatable := true
 	versionUpdatableAndDeploymentsComplete := true
+	deploymentUnavailableButUpToDate := false
+	deploymentUnavailableNotUpToDate := false
 	statusMsg := ""
 	existingDeploymentNames := sets.String{}
 	for _, dep := range existingDeployments.Items {
@@ -114,9 +120,16 @@ func (c *serviceCAOperator) syncStatus(operatorConfigCopy *operatorv1.ServiceCA,
 			continue
 		}
 		if !isDeploymentStatusAvailable(dep) {
-			statusMsg += fmt.Sprintf("\n%s does not have available replicas", dep.Name)
-			setProgressingTrue(operatorConfigCopy, reason, statusMsg)
-			setAvailableFalse(operatorConfigCopy, reason, statusMsg)
+			if isDeploymentUpToDate(dep) {
+				// The deployment spec is fully rolled out but the pod is
+				// temporarily unavailable (e.g. node reboot or pod eviction).
+				// This is not operator-initiated progress toward a new state.
+				statusMsg += fmt.Sprintf("\n%s: all replicas are up-to-date but not yet available", dep.Name)
+				deploymentUnavailableButUpToDate = true
+			} else {
+				statusMsg += fmt.Sprintf("\n%s does not have available replicas", dep.Name)
+				deploymentUnavailableNotUpToDate = true
+			}
 			versionUpdatable = false
 			versionUpdatableAndDeploymentsComplete = false
 			continue
@@ -147,6 +160,24 @@ func (c *serviceCAOperator) syncStatus(operatorConfigCopy *operatorv1.ServiceCA,
 		setAvailableTrue(operatorConfigCopy, reason)
 		setProgressingFalse(operatorConfigCopy, reason, "All service-ca-operator deployments updated")
 		c.setVersion()
+		return
+	}
+	// Deployment is up-to-date (correct version) but temporarily unavailable.
+	// This happens during node reboots or pod evictions, not operator-initiated
+	// progress. Report not Progressing since the deployment is at the desired state.
+	if deploymentUnavailableButUpToDate {
+		reason := "ManagedDeploymentsUpToDateButUnavailable"
+		setAvailableFalse(operatorConfigCopy, reason, statusMsg)
+		setProgressingFalse(operatorConfigCopy, reason, statusMsg)
+		c.setVersion()
+		return
+	}
+	// Deployment is not up-to-date and has no available replicas (e.g. recreate
+	// rollout where old pods are terminated before new ones are ready).
+	if deploymentUnavailableNotUpToDate {
+		reason := "ManagedDeploymentsNotReady"
+		setAvailableFalse(operatorConfigCopy, reason, statusMsg)
+		setProgressingTrue(operatorConfigCopy, reason, statusMsg)
 		return
 	}
 	// No instances of previous deployments,
